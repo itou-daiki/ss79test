@@ -31,6 +31,8 @@ if 'optimized_route' not in st.session_state:
     st.session_state.optimized_route = None
 if 'map_optimized_route' not in st.session_state:
     st.session_state.map_optimized_route = None
+if 'disaster_optimized_route' not in st.session_state:
+    st.session_state.disaster_optimized_route = None
 if 'gemini_api_key' not in st.session_state:
     st.session_state.gemini_api_key = ""
 
@@ -1030,13 +1032,21 @@ else:  # 防災モード
         
         with col_control:
             st.markdown("### 🚨 避難所情報")
-            
+
+            # 選択モード
+            selection_mode = st.radio(
+                "選択モード",
+                ["単一避難所", "複数避難所（最適化ルート）"],
+                key='disaster_selection_mode'
+            )
+
             # 状態フィルター
             status_filter = st.radio(
                 "表示する避難所",
-                ["すべて", "開設中のみ", "待機中のみ"]
+                ["すべて", "開設中のみ", "待機中のみ"],
+                key='disaster_status_filter'
             )
-            
+
             # フィルター適用
             if status_filter == "開設中のみ":
                 filtered_df = disaster_df[disaster_df['状態'] == '開設中']
@@ -1044,59 +1054,162 @@ else:  # 防災モード
                 filtered_df = disaster_df[disaster_df['状態'] == '待機中']
             else:
                 filtered_df = disaster_df
-            
-            # 避難所選択
-            shelter = st.selectbox(
-                "避難所を選択",
-                ['選択してください'] + filtered_df['スポット名'].tolist()
-            )
-            
-            if shelter != '選択してください':
-                shelter_row = filtered_df[filtered_df['スポット名'] == shelter].iloc[0]
-                shelter_coords = (shelter_row['緯度'], shelter_row['経度'])
-                
-                # 情報表示
-                st.warning(f"🏥 **{shelter}**")
-                
-                # 距離表示
-                distance = calculate_distance(
-                    st.session_state.current_location[0],
-                    st.session_state.current_location[1],
-                    shelter_coords[0],
-                    shelter_coords[1]
+
+            if selection_mode == "単一避難所":
+                # 単一避難所選択
+                shelter = st.selectbox(
+                    "避難所を選択",
+                    ['選択してください'] + filtered_df['スポット名'].tolist(),
+                    key='disaster_shelter_select'
                 )
-                
-                col_a, col_b = st.columns(2)
-                with col_a:
-                    st.metric("距離", f"{distance:.2f} km")
-                with col_b:
-                    walk_time = int((distance / 4) * 60)
-                    st.metric("徒歩", f"{walk_time}分")
-                
-                # 詳細情報
-                with st.expander("📊 詳細情報", expanded=True):
-                    st.write(f"**収容人数:** {shelter_row['収容人数']}名")
-                    st.write(f"**状態:** {shelter_row['状態']}")
-                    st.write(f"**説明:** {shelter_row['説明']}")
-                
-                # Google Mapsで開く
-                maps_link = create_google_maps_link(
-                    st.session_state.current_location,
-                    shelter_coords,
-                    'walking'
-                )
-                
-                st.link_button(
-                    "🚶 徒歩ルートを見る（Google Maps）",
-                    maps_link,
-                    use_container_width=True,
-                    type="primary"
-                )
-                
-                show_route = st.checkbox("地図上に直線を表示", value=True)
-            else:
+
+                if shelter != '選択してください':
+                    shelter_row = filtered_df[filtered_df['スポット名'] == shelter].iloc[0]
+                    shelter_coords = (shelter_row['緯度'], shelter_row['経度'])
+
+                    # 情報表示
+                    st.warning(f"🏥 **{shelter}**")
+
+                    # 距離表示
+                    distance = calculate_distance(
+                        st.session_state.current_location[0],
+                        st.session_state.current_location[1],
+                        shelter_coords[0],
+                        shelter_coords[1]
+                    )
+
+                    col_a, col_b = st.columns(2)
+                    with col_a:
+                        st.metric("距離", f"{distance:.2f} km")
+                    with col_b:
+                        walk_time = int((distance / 4) * 60)
+                        st.metric("徒歩", f"{walk_time}分")
+
+                    # 詳細情報
+                    with st.expander("📊 詳細情報", expanded=True):
+                        st.write(f"**収容人数:** {shelter_row['収容人数']}名")
+                        st.write(f"**状態:** {shelter_row['状態']}")
+                        st.write(f"**説明:** {shelter_row['説明']}")
+
+                    # Google Mapsで開く
+                    maps_link = create_google_maps_link(
+                        st.session_state.current_location,
+                        shelter_coords,
+                        'walking'
+                    )
+
+                    st.link_button(
+                        "🚶 徒歩ルートを見る（Google Maps）",
+                        maps_link,
+                        use_container_width=True,
+                        type="primary"
+                    )
+
+                    show_route = st.checkbox("地図上に直線を表示", value=True, key='disaster_show_route')
+                else:
+                    shelter = None
+                    show_route = False
+
+            else:  # 複数避難所選択モード
                 shelter = None
                 show_route = False
+
+                st.markdown("### 🎯 複数避難所選択")
+
+                # 複数避難所選択
+                selected_shelters_names = st.multiselect(
+                    "避難したい避難所を選択（2つ以上）",
+                    filtered_df['スポット名'].tolist(),
+                    default=[],
+                    key='disaster_multi_select'
+                )
+
+                if len(selected_shelters_names) >= 2:
+                    if st.button("🎯 最適化避難ルートを算出", type="primary", use_container_width=True, key='disaster_optimize_btn'):
+                        # 選択された避難所のインデックスを取得
+                        selected_indices = []
+                        for shelter_name in selected_shelters_names:
+                            idx = disaster_df[disaster_df['スポット名'] == shelter_name].index[0]
+                            selected_indices.append(idx)
+
+                        # 最適化ルート算出（防災モード：最近傍法）
+                        route, total_dist, total_time = optimize_route_disaster(
+                            st.session_state.current_location,
+                            disaster_df,
+                            selected_indices
+                        )
+
+                        # セッション状態に保存
+                        st.session_state.disaster_optimized_route = {
+                            'route': route,
+                            'total_distance': total_dist,
+                            'total_time': total_time,
+                            'mode': 'walking'
+                        }
+
+                        st.success("✅ 最適化避難ルートを算出しました！")
+                        st.rerun()
+
+                    # 最適化ルート表示
+                    if 'disaster_optimized_route' in st.session_state and st.session_state.disaster_optimized_route is not None:
+                        route_data = st.session_state.disaster_optimized_route
+                        route = route_data['route']
+                        total_dist = route_data['total_distance']
+                        total_time = route_data['total_time']
+
+                        st.markdown("---")
+                        st.markdown("### 📋 最適化された避難順序")
+
+                        # 統計情報
+                        col1, col2 = st.columns(2)
+                        with col1:
+                            st.metric("総移動距離", f"{total_dist:.2f} km")
+                        with col2:
+                            hours = int(total_time // 60)
+                            minutes = int(total_time % 60)
+                            st.metric("総所要時間", f"{hours}時間{minutes}分")
+
+                        # 訪問順序リスト（簡易版）
+                        with st.expander("📍 避難順序を確認", expanded=False):
+                            for i, idx in enumerate(route, 1):
+                                shelter_info = disaster_df.iloc[idx]
+                                st.write(f"{i}. {shelter_info['スポット名']} (収容: {shelter_info['収容人数']}名)")
+
+                        # Google Maps複数経由地リンク生成
+                        if len(route) > 0:
+                            origin = st.session_state.current_location
+
+                            if len(route) == 1:
+                                dest_shelter = disaster_df.iloc[route[0]]
+                                destination_coords = (dest_shelter['緯度'], dest_shelter['経度'])
+                                waypoints = []
+                            else:
+                                waypoints = []
+                                for idx in route[:-1]:
+                                    shelter_info = disaster_df.iloc[idx]
+                                    waypoints.append((shelter_info['緯度'], shelter_info['経度']))
+
+                                dest_shelter = disaster_df.iloc[route[-1]]
+                                destination_coords = (dest_shelter['緯度'], dest_shelter['経度'])
+
+                            maps_url = create_google_maps_multi_link(
+                                origin,
+                                waypoints,
+                                destination_coords,
+                                'walking'
+                            )
+
+                            st.link_button(
+                                "🚶 Google Mapで最適化避難ルートを開く",
+                                maps_url,
+                                use_container_width=True,
+                                type="primary"
+                            )
+
+                elif len(selected_shelters_names) == 1:
+                    st.warning("⚠️ 2つ以上の避難所を選択してください。")
+                else:
+                    st.info("👆 避難したい避難所を2つ以上選択してください。")
         
         with col_map:
             # 地図表示
