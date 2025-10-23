@@ -946,6 +946,15 @@ if st.session_state.mode == '観光モード':
             key='ai_interests'
         )
 
+        # その他の要望
+        st.markdown("**💬 その他の要望（任意）:**")
+        user_request = st.text_area(
+            "自由に要望を入力してください",
+            placeholder="例: 子供が楽しめるスポットを含めてほしい、写真映えする場所を優先してほしい、ランチは和食がいい、など",
+            height=100,
+            key='ai_request'
+        )
+
         # プラン生成ボタン
         if st.button("🎯 AIプランを生成", type="primary", use_container_width=True):
             if not GENAI_AVAILABLE:
@@ -1003,6 +1012,7 @@ if st.session_state.mode == '観光モード':
 - 滞在時間: {user_duration}
 - 興味: {', '.join(interest_categories)}
 - 同行者: {user_companion}
+{f'- その他の要望: {user_request}' if user_request else ''}
 
 上記の条件と現在の季節・天気を考慮して、日田市の観光プランを訪問順序を含めて具体的に提案してください。
 各スポットの魅力や、なぜそのスポットを選んだのか、季節に合わせたおすすめポイントも簡潔に説明してください。
