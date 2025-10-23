@@ -23,8 +23,6 @@ st.set_page_config(
 # セッション状態の初期化
 if 'mode' not in st.session_state:
     st.session_state.mode = '観光モード'
-if 'language' not in st.session_state:
-    st.session_state.language = '日本語'
 if 'current_location' not in st.session_state:
     st.session_state.current_location = [33.3219, 130.9414]
 if 'selected_spots' not in st.session_state:
@@ -352,34 +350,6 @@ def create_google_maps_multi_link(origin: List[float], waypoints: List[Tuple[flo
 
 # サイドバー
 with st.sidebar:
-    st.title("🗺️ 日田市総合案内コンシェルジュ")
-    st.caption("Ver. 2.1")
-    
-    # Excelファイルアップロード機能
-    with st.expander("📤 Excelファイルをアップロード"):
-        uploaded_file = st.file_uploader("spots.xlsxを選択", type=['xlsx'])
-        
-        if uploaded_file is not None:
-            st.success("✅ ファイルがアップロードされました")
-            
-            # アップロードされたファイルを一時的に保存
-            with open('spots.xlsx', 'wb') as f:
-                f.write(uploaded_file.getbuffer())
-            
-            st.info("アプリを再読み込みしてください")
-            if st.button("🔄 再読み込み"):
-                st.rerun()
-    
-    # 言語切替
-    language = st.selectbox(
-        "言語 / Language",
-        ["日本語", "English"],
-        key='language_selector'
-    )
-    st.session_state.language = language
-    
-    st.divider()
-    
     # モード選択
     mode = st.radio(
         "モード選択",
@@ -482,10 +452,16 @@ with st.sidebar:
         st.metric("開設中", "3箇所", delta="安全")
 
 # メインコンテンツ
-st.title(f"📍 {st.session_state.mode}")
+# ページトップのタイトル
+st.title("🗺️ 日田市総合案内コンシェルジュ")
+st.caption("Ver. 2.1 - 観光と防災におけるタイムパフォーマンスを向上")
+st.divider()
 
 # データ読み込み
 tourism_df, disaster_df = load_spots_data()
+
+# 現在のモード表示
+st.subheader(f"📍 {st.session_state.mode}")
 
 # モードに応じた表示
 if st.session_state.mode == '観光モード':
@@ -1524,6 +1500,5 @@ with st.expander("💡 使い方のヒント"):
 if st.checkbox("🔧 デバッグ情報を表示", value=False):
     st.json({
         "現在地": st.session_state.current_location,
-        "モード": st.session_state.mode,
-        "言語": st.session_state.language
+        "モード": st.session_state.mode
     })
