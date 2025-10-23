@@ -266,9 +266,9 @@ def create_enhanced_map(spots_df, center_location, selected_spot=None, show_rout
             <p style="margin: 5px 0;"><b>📏 現在地から:</b> {distance:.2f} km</p>
         """
         
-        # カテゴリー情報（観光モード）
-        if 'カテゴリー' in row:
-            popup_html += f'<p style="margin: 5px 0;"><b>🏷️ カテゴリー:</b> {row["カテゴリー"]}</p>'
+        # カテゴリ情報（観光モード）
+        if 'カテゴリ' in row:
+            popup_html += f'<p style="margin: 5px 0;"><b>🏷️ カテゴリ:</b> {row["カテゴリ"]}</p>'
         if '営業時間' in row:
             popup_html += f'<p style="margin: 5px 0;"><b>🕐 営業時間:</b> {row["営業時間"]}</p>'
         if '料金' in row:
