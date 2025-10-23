@@ -4,10 +4,17 @@ import folium
 from streamlit_folium import st_folium
 from datetime import datetime
 from math import radians, sin, cos, sqrt, atan2
+from typing import List, Tuple
+
+try:
+    import google.generativeai as genai
+    GENAI_AVAILABLE = True
+except ImportError:
+    GENAI_AVAILABLE = False
 
 # ページ設定
 st.set_page_config(
-    page_title="日田ナビ（Hita Navi）",
+    page_title="日田市総合案内コンシェルジュ",
     page_icon="🗺️",
     layout="wide",
     initial_sidebar_state="expanded"
@@ -22,6 +29,10 @@ if 'current_location' not in st.session_state:
     st.session_state.current_location = [33.3219, 130.9414]
 if 'selected_spots' not in st.session_state:
     st.session_state.selected_spots = []
+if 'optimized_route' not in st.session_state:
+    st.session_state.optimized_route = None
+if 'gemini_api_key' not in st.session_state:
+    st.session_state.gemini_api_key = ""
 
 # データ読み込み関数
 @st.cache_data
@@ -50,12 +61,16 @@ def load_spots_data():
         # オプションカラムの追加（存在しない場合）
         if '所要時間（参考）' not in tourism_df.columns:
             tourism_df['所要時間（参考）'] = 60  # デフォルト60分
-        if 'カテゴリー' not in tourism_df.columns:
-            tourism_df['カテゴリー'] = '観光地'
+        if 'カテゴリ' not in tourism_df.columns:
+            tourism_df['カテゴリ'] = '観光地'
         if '営業時間' not in tourism_df.columns:
             tourism_df['営業時間'] = '終日'
         if '料金' not in tourism_df.columns:
             tourism_df['料金'] = '無料'
+        if '待ち時間（分）' not in tourism_df.columns:
+            tourism_df['待ち時間（分）'] = 0
+        if '混雑状況' not in tourism_df.columns:
+            tourism_df['混雑状況'] = '空いている'
         
         if '収容人数' not in disaster_df.columns:
             disaster_df['収容人数'] = 0
@@ -76,12 +91,14 @@ def load_spots_data():
             '緯度': [33.3219, 33.3200, 33.3240, 33.2967, 33.3500, 33.3800],
             '経度': [130.9414, 130.9400, 130.9430, 130.9167, 130.9600, 130.9200],
             '所要時間（参考）': [60, 120, 45, 90, 75, 30],
-            '説明': ['江戸時代の町並みが残る歴史的な地区', '日田の名湯・温泉施設', 
-                   '日本最大の私塾跡・歴史的教育施設', '自然豊かな温泉街', 
+            '説明': ['江戸時代の町並みが残る歴史的な地区', '日田の名湯・温泉施設',
+                   '日本最大の私塾跡・歴史的教育施設', '自然豊かな温泉街',
                    '伝統工芸の陶器の里', '美しい景観のダム'],
-            'カテゴリー': ['観光地', '温泉', '歴史', '温泉', '観光地', '観光地'],
+            'カテゴリ': ['歴史', 'グルメ', '歴史', '自然', '体験', '自然'],
             '営業時間': ['終日', '9:00-21:00', '9:00-17:00', '終日', '9:00-17:00', '終日'],
-            '料金': ['無料', '500円', '300円', '無料', '無料', '無料']
+            '料金': ['無料', '500円', '300円', '無料', '無料', '無料'],
+            '待ち時間（分）': [0, 15, 0, 10, 5, 0],
+            '混雑状況': ['空いている', '混雑', '普通', '空いている', '空いている', '空いている']
         })
         disaster_df = pd.DataFrame({
             'No': [1, 2, 3, 4, 5],
@@ -102,18 +119,121 @@ def load_spots_data():
 
 # 距離計算関数
 def calculate_distance(lat1, lng1, lat2, lng2):
-    """2点間の距離を計算（km）"""
+    """2点間の距離を計算（km）- ヒュベニの公式"""
     R = 6371  # 地球の半径（km）
-    
+
     lat1_rad = radians(lat1)
     lat2_rad = radians(lat2)
     delta_lat = radians(lat2 - lat1)
     delta_lng = radians(lng2 - lng1)
-    
+
     a = sin(delta_lat/2)**2 + cos(lat1_rad) * cos(lat2_rad) * sin(delta_lng/2)**2
     c = 2 * atan2(sqrt(a), sqrt(1-a))
-    
+
     return R * c
+
+# 最適化経路算出関数（観光モード：待ち時間考慮）
+def optimize_route_tourism(current_loc: List[float], spots_df: pd.DataFrame, selected_indices: List[int]) -> Tuple[List[int], float, float]:
+    """
+    観光モード用の最適化経路算出（待ち時間と距離を考慮）
+    Returns: (訪問順のインデックスリスト, 総移動距離, 総所要時間)
+    """
+    if not selected_indices:
+        return [], 0.0, 0.0
+
+    unvisited = selected_indices.copy()
+    route = []
+    current_position = current_loc
+    total_distance = 0.0
+    total_time = 0.0
+
+    while unvisited:
+        # 各未訪問スポットのスコアを計算
+        scores = []
+        distances = []
+        wait_times = []
+
+        for idx in unvisited:
+            spot = spots_df.iloc[idx]
+            dist = calculate_distance(
+                current_position[0], current_position[1],
+                spot['緯度'], spot['経度']
+            )
+            distances.append(dist)
+            wait_time = spot.get('待ち時間（分）', 0)
+            wait_times.append(wait_time)
+
+        # 距離ランキング（近い順に1, 2, 3...）
+        distance_ranks = [sorted(distances).index(d) + 1 for d in distances]
+
+        # 待ち時間ランキング（短い順に1, 2, 3...）
+        wait_time_ranks = [sorted(wait_times).index(w) + 1 for w in wait_times]
+
+        # スコア計算: S = RD + RW（小さいほど良い）
+        scores = [distance_ranks[i] + wait_time_ranks[i] for i in range(len(unvisited))]
+
+        # 最小スコアのスポットを選択
+        min_score_idx = scores.index(min(scores))
+        selected_idx = unvisited[min_score_idx]
+
+        route.append(selected_idx)
+        selected_spot = spots_df.iloc[selected_idx]
+
+        # 移動距離と時間を加算
+        travel_dist = distances[min_score_idx]
+        total_distance += travel_dist
+        total_time += (travel_dist / 40) * 60  # 時速40kmで計算（分）
+        total_time += selected_spot.get('所要時間（参考）', 60)
+        total_time += selected_spot.get('待ち時間（分）', 0)
+
+        # 現在地を更新
+        current_position = [selected_spot['緯度'], selected_spot['経度']]
+        unvisited.remove(selected_idx)
+
+    return route, total_distance, total_time
+
+# 最適化経路算出関数（防災モード：最近傍法）
+def optimize_route_disaster(current_loc: List[float], spots_df: pd.DataFrame, selected_indices: List[int]) -> Tuple[List[int], float, float]:
+    """
+    防災モード用の最適化経路算出（距離のみ考慮）
+    Returns: (訪問順のインデックスリスト, 総移動距離, 総所要時間)
+    """
+    if not selected_indices:
+        return [], 0.0, 0.0
+
+    unvisited = selected_indices.copy()
+    route = []
+    current_position = current_loc
+    total_distance = 0.0
+    total_time = 0.0
+
+    while unvisited:
+        # 最も近いスポットを選択
+        min_dist = float('inf')
+        nearest_idx = None
+
+        for idx in unvisited:
+            spot = spots_df.iloc[idx]
+            dist = calculate_distance(
+                current_position[0], current_position[1],
+                spot['緯度'], spot['経度']
+            )
+            if dist < min_dist:
+                min_dist = dist
+                nearest_idx = idx
+
+        route.append(nearest_idx)
+        selected_spot = spots_df.iloc[nearest_idx]
+
+        # 移動距離と時間を加算
+        total_distance += min_dist
+        total_time += (min_dist / 4) * 60  # 徒歩時速4kmで計算（分）
+
+        # 現在地を更新
+        current_position = [selected_spot['緯度'], selected_spot['経度']]
+        unvisited.remove(nearest_idx)
+
+    return route, total_distance, total_time
 
 # 地図作成関数（改良版）
 def create_enhanced_map(spots_df, center_location, selected_spot=None, show_route=False):
@@ -187,9 +307,9 @@ def create_enhanced_map(spots_df, center_location, selected_spot=None, show_rout
     
     return m
 
-# Google Mapsリンク生成関数
+# Google Mapsリンク生成関数（単一目的地）
 def create_google_maps_link(origin, destination, mode='driving'):
-    """Google Mapsの外部リンクを生成"""
+    """Google Mapsの外部リンクを生成（単一目的地）"""
     modes = {
         'driving': 'driving',
         'walking': 'walking',
@@ -200,10 +320,40 @@ def create_google_maps_link(origin, destination, mode='driving'):
     link = f"{base_url}&origin={origin[0]},{origin[1]}&destination={destination[0]},{destination[1]}&travelmode={modes[mode]}"
     return link
 
+# Google Mapsリンク生成関数（複数経由地）
+def create_google_maps_multi_link(origin: List[float], waypoints: List[Tuple[float, float]], destination: Tuple[float, float], mode='driving') -> str:
+    """
+    Google Mapsの外部リンクを生成（複数経由地対応）
+    Args:
+        origin: 出発地 [緯度, 経度]
+        waypoints: 経由地のリスト [(緯度, 経度), ...]
+        destination: 最終目的地 (緯度, 経度)
+        mode: 移動手段
+    Returns:
+        Google Maps URL
+    """
+    modes = {
+        'driving': 'driving',
+        'walking': 'walking',
+        'bicycling': 'bicycling',
+        'transit': 'transit'
+    }
+
+    base_url = "https://www.google.com/maps/dir/?api=1"
+    url = f"{base_url}&origin={origin[0]},{origin[1]}&destination={destination[0]},{destination[1]}"
+
+    if waypoints:
+        waypoints_str = "|".join([f"{lat},{lng}" for lat, lng in waypoints])
+        url += f"&waypoints={waypoints_str}"
+
+    url += f"&travelmode={modes.get(mode, 'driving')}"
+
+    return url
+
 # サイドバー
 with st.sidebar:
-    st.title("🗺️ 日田ナビ")
-    st.caption("APIキー不要版")
+    st.title("🗺️ 日田市総合案内コンシェルジュ")
+    st.caption("Ver. 2.1")
     
     # Excelファイルアップロード機能
     with st.expander("📤 Excelファイルをアップロード"):
@@ -339,7 +489,15 @@ tourism_df, disaster_df = load_spots_data()
 
 # モードに応じた表示
 if st.session_state.mode == '観光モード':
-    tab1, tab2, tab3, tab4, tab5 = st.tabs(["🗺️ マップ", "📋 スポット一覧", "🌤️ 天気", "📅 イベント", "💡 おすすめプラン"])
+    tab1, tab2, tab3, tab4, tab5, tab6, tab7 = st.tabs([
+        "🗺️ マップ",
+        "📋 スポット一覧",
+        "🎯 最適化ルート",
+        "🌤️ 天気",
+        "📅 イベント",
+        "📊 ランキング",
+        "🤖 AIプラン提案"
+    ])
     
     with tab1:
         st.subheader("🗺️ 観光マップ")
@@ -350,12 +508,12 @@ if st.session_state.mode == '観光モード':
             st.markdown("### 🎯 目的地選択")
             
             # カテゴリーフィルター
-            categories = ['すべて'] + sorted(tourism_df['カテゴリー'].unique().tolist())
+            categories = ['すべて'] + sorted(tourism_df['カテゴリ'].unique().tolist())
             selected_category = st.selectbox("カテゴリー", categories)
-            
+
             # フィルター適用
             if selected_category != 'すべて':
-                filtered_df = tourism_df[tourism_df['カテゴリー'] == selected_category]
+                filtered_df = tourism_df[tourism_df['カテゴリ'] == selected_category]
             else:
                 filtered_df = tourism_df
             
@@ -392,10 +550,12 @@ if st.session_state.mode == '観光モード':
                 # 詳細情報
                 with st.expander("📝 詳細情報", expanded=True):
                     st.write(f"**説明:** {dest_row['説明']}")
-                    st.write(f"**カテゴリー:** {dest_row['カテゴリー']}")
+                    st.write(f"**カテゴリー:** {dest_row['カテゴリ']}")
                     st.write(f"**営業時間:** {dest_row['営業時間']}")
                     st.write(f"**料金:** {dest_row['料金']}")
                     st.write(f"**所要時間（参考）:** {dest_row['所要時間（参考）']}分")
+                    st.write(f"**待ち時間:** {dest_row['待ち時間（分）']}分")
+                    st.write(f"**混雑状況:** {dest_row['混雑状況']}")
                 
                 st.markdown("---")
                 st.markdown("### 🚗 ルート案内")
@@ -488,7 +648,7 @@ if st.session_state.mode == '観光モード':
                 with col1:
                     st.markdown(f"### {row['スポット名']}")
                     st.write(f"📝 {row['説明']}")
-                    st.caption(f"🏷️ {row['カテゴリー']} | 🕐 {row['営業時間']} | 💰 {row['料金']}")
+                    st.caption(f"🏷️ {row['カテゴリ']} | 🕐 {row['営業時間']} | 💰 {row['料金']}")
                 
                 with col2:
                     st.metric("距離", f"{row['距離']:.2f}km")
@@ -502,8 +662,154 @@ if st.session_state.mode == '観光モード':
                     st.link_button("🗺️", maps_link, use_container_width=True)
                 
                 st.divider()
-    
+
     with tab3:
+        st.subheader("🎯 最適化ルート算出")
+
+        st.info("複数のスポットを選択して、最適な訪問順序を自動で算出します。観光モードでは待ち時間と距離を考慮します。")
+
+        # 複数スポット選択
+        st.markdown("### 📍 訪問したいスポットを選択")
+
+        selected_spots_names = st.multiselect(
+            "複数のスポットを選択してください（2つ以上）",
+            tourism_df['スポット名'].tolist(),
+            default=[]
+        )
+
+        if len(selected_spots_names) >= 2:
+            # 選択されたスポットのインデックスを取得
+            selected_indices = []
+            for spot_name in selected_spots_names:
+                idx = tourism_df[tourism_df['スポット名'] == spot_name].index[0]
+                selected_indices.append(idx)
+
+            # 移動手段選択
+            travel_mode_opt = st.selectbox(
+                "🚗 移動手段",
+                ["driving", "walking", "bicycling", "transit"],
+                format_func=lambda x: {
+                    'driving': '🚗 車',
+                    'walking': '🚶 徒歩',
+                    'bicycling': '🚲 自転車',
+                    'transit': '🚌 公共交通'
+                }[x],
+                key='opt_travel_mode'
+            )
+
+            if st.button("🎯 最適化ルートを算出", type="primary", use_container_width=True):
+                # 最適化ルート算出
+                route, total_dist, total_time = optimize_route_tourism(
+                    st.session_state.current_location,
+                    tourism_df,
+                    selected_indices
+                )
+
+                st.session_state.optimized_route = {
+                    'route': route,
+                    'total_distance': total_dist,
+                    'total_time': total_time,
+                    'mode': travel_mode_opt
+                }
+
+                st.success("✅ 最適化ルートを算出しました！")
+
+            # 最適化ルート表示
+            if st.session_state.optimized_route is not None:
+                route_data = st.session_state.optimized_route
+                route = route_data['route']
+                total_dist = route_data['total_distance']
+                total_time = route_data['total_time']
+
+                st.markdown("---")
+                st.markdown("### 📋 最適化された訪問順序")
+
+                # 統計情報
+                col1, col2, col3 = st.columns(3)
+                with col1:
+                    st.metric("総移動距離", f"{total_dist:.2f} km")
+                with col2:
+                    hours = int(total_time // 60)
+                    minutes = int(total_time % 60)
+                    st.metric("総所要時間", f"{hours}時間{minutes}分")
+                with col3:
+                    st.metric("訪問スポット数", f"{len(route)}箇所")
+
+                st.markdown("---")
+
+                # 訪問順序リスト
+                for i, idx in enumerate(route, 1):
+                    spot = tourism_df.iloc[idx]
+
+                    with st.expander(f"{i}. {spot['スポット名']}", expanded=True):
+                        col_a, col_b = st.columns([2, 1])
+                        with col_a:
+                            st.write(f"**説明:** {spot['説明']}")
+                            st.write(f"**カテゴリー:** {spot['カテゴリ']}")
+                            st.write(f"**営業時間:** {spot['営業時間']}")
+                            st.write(f"**料金:** {spot['料金']}")
+                            st.write(f"**所要時間:** {spot['所要時間（参考）']}分")
+                            st.write(f"**待ち時間:** {spot['待ち時間（分）']}分")
+                            st.write(f"**混雑状況:** {spot['混雑状況']}")
+                        with col_b:
+                            # 現在地からの距離（参考）
+                            if i == 1:
+                                prev_loc = st.session_state.current_location
+                            else:
+                                prev_spot = tourism_df.iloc[route[i-2]]
+                                prev_loc = [prev_spot['緯度'], prev_spot['経度']]
+
+                            dist_from_prev = calculate_distance(
+                                prev_loc[0], prev_loc[1],
+                                spot['緯度'], spot['経度']
+                            )
+                            st.metric("移動距離", f"{dist_from_prev:.2f} km")
+
+                st.markdown("---")
+                st.markdown("### 🗺️ Google Mapで開く")
+
+                # Google Maps複数経由地リンク生成
+                if len(route) > 0:
+                    # 出発地
+                    origin = st.session_state.current_location
+
+                    # 経由地と最終目的地
+                    if len(route) == 1:
+                        # 1箇所のみ
+                        dest_spot = tourism_df.iloc[route[0]]
+                        destination = (dest_spot['緯度'], dest_spot['経度'])
+                        waypoints = []
+                    else:
+                        # 2箇所以上
+                        waypoints = []
+                        for idx in route[:-1]:
+                            spot = tourism_df.iloc[idx]
+                            waypoints.append((spot['緯度'], spot['経度']))
+
+                        dest_spot = tourism_df.iloc[route[-1]]
+                        destination = (dest_spot['緯度'], dest_spot['経度'])
+
+                    # リンク生成
+                    maps_url = create_google_maps_multi_link(
+                        origin,
+                        waypoints,
+                        destination,
+                        route_data['mode']
+                    )
+
+                    st.link_button(
+                        "🗺️ Google Mapで最適化ルートを開く",
+                        maps_url,
+                        use_container_width=True,
+                        type="primary"
+                    )
+
+        elif len(selected_spots_names) == 1:
+            st.warning("⚠️ 2つ以上のスポットを選択してください。")
+        else:
+            st.info("👆 訪問したいスポットを2つ以上選択してください。")
+
+    with tab4:
         st.subheader("🌤️ 天気情報・気象情報")
         
         st.info("📊 詳細な天気情報は外部サイトをご利用ください")
@@ -608,50 +914,233 @@ if st.session_state.mode == '観光モード':
             st.info(f"{selected_month}月には現在登録されているイベントはありません")
     
     with tab5:
-        st.subheader("💡 おすすめプラン提案")
-        
-        col1, col2, col3 = st.columns(3)
+        st.subheader("📅 年間イベントカレンダー")
+
+        col1, col2 = st.columns([1, 3])
         with col1:
-            plan_type = st.selectbox(
-                "👥 プランタイプ",
-                ["家族向け", "一人旅向け", "カップル向け", "グループ向け"]
+            selected_month = st.selectbox(
+                "月を選択",
+                list(range(1, 13)),
+                index=datetime.now().month - 1,
+                format_func=lambda x: f"{x}月",
+                key='event_month'
             )
-        with col2:
-            budget = st.selectbox(
-                "💰 予算",
-                ["0～5,000円", "5,001～10,000円", "10,001～30,000円", "30,000円以上"]
-            )
-        with col3:
-            duration = st.selectbox(
-                "⏱️ 滞在時間",
-                ["半日（3-4時間）", "1日（6-8時間）", "1泊2日", "2泊3日"]
-            )
-        
-        if st.button("🎯 プランを提案", type="primary", use_container_width=True):
-            st.success(f"✅ {plan_type} {budget} {duration}のプランを提案します")
-            
-            # サンプルプラン
-            st.markdown("### 📋 提案されたプラン")
-            
-            plan_spots = tourism_df.sample(min(3, len(tourism_df)))
-            
-            for i, (idx, spot) in enumerate(plan_spots.iterrows(), 1):
-                with st.expander(f"スポット{i}: {spot['スポット名']}", expanded=True):
-                    col_a, col_b = st.columns([2, 1])
-                    with col_a:
-                        st.write(f"**説明:** {spot['説明']}")
-                        st.write(f"**料金:** {spot['料金']}")
-                        st.write(f"**おすすめ滞在時間:** 1-2時間")
-                    with col_b:
+
+        # サンプルイベントデータ
+        events = {
+            5: [("日田川開き観光祭", "5月20日-21日", "花火大会と伝統行事")],
+            7: [("祇園祭", "7月20日-21日", "300年の歴史を持つ祭り")],
+            10: [("日田天領まつり", "10月中旬", "時代行列と郷土芸能")],
+            11: [("天ヶ瀬温泉もみじ祭り", "11月中旬", "紅葉の名所でのイベント")]
+        }
+
+        if selected_month in events:
+            for event_name, event_date, event_desc in events[selected_month]:
+                with st.container():
+                    st.markdown(f"### 🎉 {event_name}")
+                    st.write(f"📅 **開催日:** {event_date}")
+                    st.write(f"📝 **内容:** {event_desc}")
+                    st.divider()
+        else:
+            st.info(f"{selected_month}月には現在登録されているイベントはありません")
+
+    with tab6:
+        st.subheader("📊 月別人気観光地ランキング")
+
+        # 月選択
+        ranking_month = st.selectbox(
+            "🗓️ 月を選択",
+            list(range(1, 13)),
+            index=datetime.now().month - 1,
+            format_func=lambda x: f"{x}月",
+            key='ranking_month'
+        )
+
+        st.markdown(f"### {ranking_month}月の人気観光地トップ5")
+
+        # サンプルランキングデータ（実際はデータベースから取得）
+        rankings = {
+            5: [
+                ("豆田町", 1250, "🔥 大人気！"),
+                ("日田温泉", 980, "人気上昇中"),
+                ("咸宜園", 720, ""),
+                ("天ヶ瀬温泉", 650, ""),
+                ("小鹿田焼の里", 520, "")
+            ],
+            7: [
+                ("天ヶ瀬温泉", 1450, "🔥 大人気！"),
+                ("豆田町", 1100, ""),
+                ("日田温泉", 890, ""),
+                ("大山ダム", 680, ""),
+                ("咸宜園", 550, "")
+            ],
+            10: [
+                ("豆田町", 1580, "🔥 大人気！"),
+                ("咸宜園", 920, "人気上昇中"),
+                ("日田温泉", 810, ""),
+                ("小鹿田焼の里", 690, ""),
+                ("天ヶ瀬温泉", 620, "")
+            ],
+            11: [
+                ("天ヶ瀬温泉", 1680, "🔥 大人気！"),
+                ("大山ダム", 1120, "人気上昇中"),
+                ("豆田町", 950, ""),
+                ("日田温泉", 780, ""),
+                ("咸宜園", 620, "")
+            ]
+        }
+
+        # デフォルトランキング（指定月のデータがない場合）
+        default_ranking = [
+            ("豆田町", 1000, ""),
+            ("日田温泉", 850, ""),
+            ("咸宜園", 700, ""),
+            ("天ヶ瀬温泉", 650, ""),
+            ("小鹿田焼の里", 550, "")
+        ]
+
+        current_ranking = rankings.get(ranking_month, default_ranking)
+
+        for i, (spot_name, visitors, badge) in enumerate(current_ranking, 1):
+            # スポット情報を取得
+            spot_df = tourism_df[tourism_df['スポット名'] == spot_name]
+
+            if len(spot_df) > 0:
+                spot = spot_df.iloc[0]
+
+                with st.container():
+                    col_rank, col_info, col_visitors = st.columns([0.5, 3, 1])
+
+                    with col_rank:
+                        if i == 1:
+                            st.markdown("## 🥇")
+                        elif i == 2:
+                            st.markdown("## 🥈")
+                        elif i == 3:
+                            st.markdown("## 🥉")
+                        else:
+                            st.markdown(f"## {i}位")
+
+                    with col_info:
+                        st.markdown(f"### {spot_name} {badge}")
+                        st.write(f"📝 {spot['説明']}")
+                        st.caption(f"🏷️ {spot['カテゴリ']} | 💰 {spot['料金']}")
+
+                    with col_visitors:
+                        st.metric("訪問者数", f"{visitors}人")
                         maps_link = create_google_maps_link(
                             st.session_state.current_location,
                             (spot['緯度'], spot['経度']),
                             'driving'
                         )
-                        st.link_button("🗺️ ルートを見る", maps_link, use_container_width=True)
+                        st.link_button("🗺️", maps_link, use_container_width=True)
+
+                    st.divider()
+
+    with tab7:
+        st.subheader("🤖 AIプラン提案（Gemini API）")
+
+        st.info("Gemini AIがあなたの予算・時間・興味に合わせた最適な観光プランを提案します。")
+
+        # APIキー入力
+        st.markdown("### 🔑 APIキー設定")
+
+        api_key_input = st.text_input(
+            "Gemini APIキーを入力してください",
+            type="password",
+            value=st.session_state.gemini_api_key,
+            help="APIキーはセッション中のみ保持され、サーバーには保存されません"
+        )
+
+        if api_key_input:
+            st.session_state.gemini_api_key = api_key_input
+
+        st.markdown("[🔑 Gemini APIキーを取得する →](https://aistudio.google.com/app/apikey)")
+
+        st.divider()
+
+        # プラン条件入力
+        st.markdown("### 📝 プラン条件を入力")
+
+        col1, col2 = st.columns(2)
+
+        with col1:
+            user_budget = st.text_input("💰 予算", placeholder="例: 5000円以内", key='ai_budget')
+            user_duration = st.text_input("⏱️ 滞在時間", placeholder="例: 3時間", key='ai_duration')
+
+        with col2:
+            user_companion = st.selectbox(
+                "👥 同行者",
+                ["一人旅", "家族連れ", "カップル", "友人グループ"],
+                key='ai_companion'
+            )
+
+        # 興味カテゴリー
+        st.markdown("**🎯 興味のあるカテゴリー（複数選択可）:**")
+        interest_categories = st.multiselect(
+            "興味のあるカテゴリーを選択",
+            ["歴史", "自然", "グルメ", "体験", "温泉", "文化"],
+            default=["歴史"],
+            key='ai_interests'
+        )
+
+        # プラン生成ボタン
+        if st.button("🎯 AIプランを生成", type="primary", use_container_width=True):
+            if not GENAI_AVAILABLE:
+                st.error("❌ google-generativeai パッケージがインストールされていません。")
+                st.info("以下のコマンドでインストールしてください: `pip install google-generativeai`")
+            elif not st.session_state.gemini_api_key:
+                st.error("❌ Gemini APIキーを入力してください")
+            elif not user_budget or not user_duration:
+                st.warning("⚠️ 予算と滞在時間を入力してください")
+            else:
+                try:
+                    with st.spinner("🤖 AIがプランを生成中..."):
+                        # Gemini API設定
+                        genai.configure(api_key=st.session_state.gemini_api_key)
+                        model = genai.GenerativeModel('gemini-2.0-flash-exp')
+
+                        # スポットリスト作成
+                        spots_context = []
+                        for _, spot in tourism_df.iterrows():
+                            spots_context.append(
+                                f"- {spot['スポット名']}: {spot['説明']} (カテゴリ: {spot['カテゴリ']}, 料金: {spot['料金']}, 所要時間: {spot['所要時間（参考）']}分)"
+                            )
+                        spots_text = "\n".join(spots_context)
+
+                        # プロンプト作成
+                        system_prompt = "あなたは日田市の観光コンシェルジュです。以下の観光スポットリストとユーザーの要望に基づき、魅力的な観光プランを提案してください。"
+
+                        user_prompt = f"""
+観光スポットリスト:
+{spots_text}
+
+ユーザーの要望:
+- 予算: {user_budget}
+- 滞在時間: {user_duration}
+- 興味: {', '.join(interest_categories)}
+- 同行者: {user_companion}
+
+上記の条件に合った日田市の観光プランを、訪問順序を含めて具体的に提案してください。
+各スポットの魅力や、なぜそのスポットを選んだのかも簡潔に説明してください。
+                        """
+
+                        # API呼び出し
+                        response = model.generate_content(f"{system_prompt}\n\n{user_prompt}")
+
+                        # 結果表示
+                        st.markdown("---")
+                        st.markdown("### 📋 AI提案プラン")
+                        st.markdown(response.text)
+
+                        st.success("✅ プラン生成完了！")
+
+                except Exception as e:
+                    st.error(f"❌ エラーが発生しました: {str(e)}")
+                    st.info("💡 APIキーが正しいか確認してください。また、Gemini APIが有効化されているか確認してください。")
 
 else:  # 防災モード
-    tab1, tab2, tab3 = st.tabs(["🏥 避難所マップ", "🗾 ハザードマップ", "📢 防災情報"])
+    tab1, tab2, tab3, tab4 = st.tabs(["🏥 避難所マップ", "🎯 最適化ルート", "🗾 ハザードマップ", "📢 防災情報"])
     
     with tab1:
         st.subheader("🏥 避難所マップ")
@@ -737,8 +1226,139 @@ else:  # 防災モード
                 show_route=show_route
             )
             st_folium(m, width=700, height=600, key='disaster_map')
-    
+
     with tab2:
+        st.subheader("🎯 最適化避難ルート算出")
+
+        st.info("複数の避難所を選択して、最短距離での巡回順序を自動で算出します。防災モードでは距離のみを考慮します。")
+
+        # 複数避難所選択
+        st.markdown("### 🏥 訪問したい避難所を選択")
+
+        selected_shelters_names = st.multiselect(
+            "複数の避難所を選択してください（2つ以上）",
+            disaster_df['スポット名'].tolist(),
+            default=[]
+        )
+
+        if len(selected_shelters_names) >= 2:
+            # 選択された避難所のインデックスを取得
+            selected_indices = []
+            for shelter_name in selected_shelters_names:
+                idx = disaster_df[disaster_df['スポット名'] == shelter_name].index[0]
+                selected_indices.append(idx)
+
+            if st.button("🎯 最適化避難ルートを算出", type="primary", use_container_width=True):
+                # 最適化ルート算出（防災モード：最近傍法）
+                route, total_dist, total_time = optimize_route_disaster(
+                    st.session_state.current_location,
+                    disaster_df,
+                    selected_indices
+                )
+
+                st.session_state.optimized_route = {
+                    'route': route,
+                    'total_distance': total_dist,
+                    'total_time': total_time,
+                    'mode': 'walking'
+                }
+
+                st.success("✅ 最適化避難ルートを算出しました！")
+
+            # 最適化ルート表示
+            if st.session_state.optimized_route is not None:
+                route_data = st.session_state.optimized_route
+                route = route_data['route']
+                total_dist = route_data['total_distance']
+                total_time = route_data['total_time']
+
+                st.markdown("---")
+                st.markdown("### 📋 最適化された避難順序")
+
+                # 統計情報
+                col1, col2, col3 = st.columns(3)
+                with col1:
+                    st.metric("総移動距離", f"{total_dist:.2f} km")
+                with col2:
+                    hours = int(total_time // 60)
+                    minutes = int(total_time % 60)
+                    st.metric("総所要時間（徒歩）", f"{hours}時間{minutes}分")
+                with col3:
+                    st.metric("避難所数", f"{len(route)}箇所")
+
+                st.markdown("---")
+
+                # 訪問順序リスト
+                for i, idx in enumerate(route, 1):
+                    shelter = disaster_df.iloc[idx]
+
+                    with st.expander(f"{i}. {shelter['スポット名']}", expanded=True):
+                        col_a, col_b = st.columns([2, 1])
+                        with col_a:
+                            st.write(f"**説明:** {shelter['説明']}")
+                            st.write(f"**収容人数:** {shelter['収容人数']}名")
+                            st.write(f"**状態:** {shelter['状態']}")
+                        with col_b:
+                            # 前の地点からの距離
+                            if i == 1:
+                                prev_loc = st.session_state.current_location
+                            else:
+                                prev_shelter = disaster_df.iloc[route[i-2]]
+                                prev_loc = [prev_shelter['緯度'], prev_shelter['経度']]
+
+                            dist_from_prev = calculate_distance(
+                                prev_loc[0], prev_loc[1],
+                                shelter['緯度'], shelter['経度']
+                            )
+                            st.metric("移動距離", f"{dist_from_prev:.2f} km")
+                            walk_time = int((dist_from_prev / 4) * 60)
+                            st.metric("徒歩時間", f"{walk_time}分")
+
+                st.markdown("---")
+                st.markdown("### 🗺️ Google Mapで開く")
+
+                # Google Maps複数経由地リンク生成
+                if len(route) > 0:
+                    # 出発地
+                    origin = st.session_state.current_location
+
+                    # 経由地と最終目的地
+                    if len(route) == 1:
+                        # 1箇所のみ
+                        dest_shelter = disaster_df.iloc[route[0]]
+                        destination = (dest_shelter['緯度'], dest_shelter['経度'])
+                        waypoints = []
+                    else:
+                        # 2箇所以上
+                        waypoints = []
+                        for idx in route[:-1]:
+                            shelter = disaster_df.iloc[idx]
+                            waypoints.append((shelter['緯度'], shelter['経度']))
+
+                        dest_shelter = disaster_df.iloc[route[-1]]
+                        destination = (dest_shelter['緯度'], dest_shelter['経度'])
+
+                    # リンク生成
+                    maps_url = create_google_maps_multi_link(
+                        origin,
+                        waypoints,
+                        destination,
+                        'walking'
+                    )
+
+                    st.link_button(
+                        "🚶 徒歩で最適化ルートを開く（Google Maps）",
+                        maps_url,
+                        use_container_width=True,
+                        type="primary"
+                    )
+
+        elif len(selected_shelters_names) == 1:
+            st.warning("⚠️ 2つ以上の避難所を選択してください。")
+        else:
+            st.info("👆 訪問したい避難所を2つ以上選択してください。")
+
+    with tab3:
         st.subheader("🗾 ハザードマップ")
         
         hazard_type = st.selectbox(
@@ -765,8 +1385,8 @@ else:  # 防災モード
             "https://www.city.hita.oita.jp/",
             use_container_width=True
         )
-    
-    with tab3:
+
+    with tab4:
         st.subheader("📢 防災情報")
         
         col1, col2 = st.columns(2)
@@ -847,7 +1467,7 @@ st.divider()
 
 col1, col2, col3 = st.columns(3)
 with col1:
-    st.caption("© 2025 日田ナビ（Hita Navi）")
+    st.caption("© 2025 日田市総合案内コンシェルジュ")
 with col2:
     st.caption("📧 お問い合わせ")
 with col3:
@@ -856,34 +1476,48 @@ with col3:
 # 使い方ヒント
 with st.expander("💡 使い方のヒント"):
     st.markdown("""
-    ### 📖 日田ナビの使い方
-    
+    ### 📖 日田市総合案内コンシェルジュの使い方
+
     #### 観光モードでできること
     1. **地図でスポットを確認**: マップタブで日田市内の観光スポットを一覧表示
     2. **目的地を選択**: 行きたい場所を選ぶと、距離と概算時間を表示
-    3. **ルート案内**: 「Google Mapsでルートを見る」ボタンで実際の道路に沿ったナビゲーション
+    3. **最適化ルート**: 複数スポットを選択すると、待ち時間と距離を考慮した最適な訪問順序を算出
     4. **スポット検索**: スポット一覧タブでキーワード検索や並び替えが可能
     5. **天気情報**: 天気タブで気象情報サイトへアクセス
     6. **イベント情報**: 月別にイベントを確認できます
-    7. **プラン提案**: 予算や滞在時間に合わせたおすすめプランを提案
-    
+    7. **人気ランキング**: 月別の人気観光地ランキングを確認
+    8. **AIプラン提案**: Gemini APIを使って、予算・時間・興味に合わせた最適な観光プランを自動生成
+
     #### 防災モードでできること
     1. **最寄り避難所の確認**: 現在地から近い避難所を表示
-    2. **避難ルート**: 徒歩での避難ルートをGoogle Mapsで確認
-    3. **開設状況の確認**: 避難所の開設状況と収容人数をリアルタイム表示
-    4. **営業店舗情報**: 災害時の営業中コンビニ・スーパーを確認
-    5. **防災グッズ提案**: 予算に応じた防災グッズのおすすめ
-    
+    2. **最適化避難ルート**: 複数の避難所を選択すると、最短距離での巡回順序を算出
+    3. **避難ルート**: 徒歩での避難ルートをGoogle Mapsで確認
+    4. **開設状況の確認**: 避難所の開設状況と収容人数をリアルタイム表示
+    5. **営業店舗情報**: 災害時の営業中コンビニ・スーパーを確認
+    6. **防災グッズ提案**: 予算に応じた防災グッズのおすすめ
+
+    #### 最適化ルート機能について
+    - **観光モード**: 待ち時間と距離を考慮したスコアリングで最適な訪問順序を算出
+    - **防災モード**: 最近傍法により最短距離での避難順序を算出
+    - Google Maps連携で実際のルートをナビゲーション可能
+
+    #### AIプラン提案機能について
+    - Gemini API（gemini-2.0-flash-exp）を使用
+    - ユーザーが自身のAPIキーを入力（セッション中のみ保持）
+    - 予算、時間、興味、同行者に基づいた具体的なプランを生成
+
     #### 便利な機能
     - **現在地の設定**: サイドバーから緯度・経度を入力、またはプリセット位置から選択
-    - **カテゴリーフィルター**: 観光地、温泉、歴史など、カテゴリー別に絞り込み
+    - **カテゴリーフィルター**: 歴史、自然、グルメ、体験など、カテゴリー別に絞り込み
     - **距離表示**: すべてのスポットに現在地からの距離を表示
     - **直線表示**: 地図上で現在地から目的地への直線を表示可能
-    
+    - **待ち時間・混雑状況**: 飲食店や観光地の待ち時間と混雑状況を確認可能
+
     #### Google Maps連携について
     - 実際の道路に沿ったルート案内は、「Google Mapsでルートを見る」ボタンから外部アプリで確認できます
     - 移動手段（車・徒歩・自転車・公共交通）を選択してからボタンを押してください
     - スマートフォンではGoogle Mapsアプリが自動的に開きます
+    - 最適化ルートでは複数の経由地を含むルートをGoogle Mapsで開くことができます
     """)
 
 # デバッグ情報（開発時のみ表示）
